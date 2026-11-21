@@ -1,0 +1,14 @@
+*.pyc
+*.db
+*.coverprofile
+.vscode/
+kala
+vendor
+.idea/*
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+secrets/
+*.token
