@@ -116,3 +116,77 @@ func (d DB) Save(j *job.Job) error {
 func (d DB) Close() error {
 	return d.conn.Close()
 }
+
+// ApplyBatch writes the whole batch in one SQL transaction. Postgres commits a
+// transaction entirely or not at all, so a crash leaves no half-updated
+// reference graph.
+func (d DB) ApplyBatch(batch job.JobBatch) error {
+	transaction, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	rollback := func(err error) error {
+		transaction.Rollback() //nolint:errcheck // adding insult to injury
+		return err
+	}
+
+	insertQuery := fmt.Sprintf(`insert into %[1]s (job) values($1);`, TABLE_NAME)
+	updateQuery := fmt.Sprintf(`update %[1]s set job = $1 where job ->> 'id' = $2;`, TABLE_NAME)
+	deleteQuery := fmt.Sprintf(`delete from %[1]s where job ->> 'id' = $1;`, TABLE_NAME)
+
+	for _, j := range batch.Saves {
+		encoded, err := json.Marshal(j)
+		if err != nil {
+			return rollback(err)
+		}
+		if _, err := transaction.Exec(insertQuery, string(encoded)); err != nil {
+			return rollback(err)
+		}
+	}
+	for _, upd := range batch.Updates {
+		encoded, found, err := encodeReferenceUpdate(transaction, upd)
+		if err != nil {
+			return rollback(err)
+		}
+		if found {
+			if _, err := transaction.Exec(updateQuery, encoded, upd.Id); err != nil {
+				return rollback(err)
+			}
+		}
+	}
+	for _, id := range batch.Deletes {
+		if _, err := transaction.Exec(deleteQuery, id); err != nil {
+			return rollback(err)
+		}
+	}
+	return transaction.Commit()
+}
+
+// encodeReferenceUpdate reads the stored job and returns its record with only
+// the reference lists replaced. It reports false when the job is absent.
+func encodeReferenceUpdate(tx *sql.Tx, upd job.JobReferenceUpdate) (string, bool, error) {
+	var raw sql.NullString
+	query := fmt.Sprintf(`select to_jsonb(j.job) from (select * from %[1]s where job ->> 'id' = $1) as j;`, TABLE_NAME)
+	if err := tx.QueryRow(query, upd.Id).Scan(&raw); err != nil {
+		if err == sql.ErrNoRows {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	if !raw.Valid {
+		return "", false, nil
+	}
+	stored := &job.Job{}
+	if err := json.Unmarshal([]byte(raw.String), stored); err != nil {
+		return "", false, err
+	}
+	stored.ParentJobs = upd.ParentJobs
+	stored.DependentJobs = upd.DependentJobs
+	encoded, err := json.Marshal(stored)
+	if err != nil {
+		return "", false, err
+	}
+	return string(encoded), true, nil
+}
+
+var _ job.BatchJobDB = (*DB)(nil)

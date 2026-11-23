@@ -85,9 +85,47 @@ func (kc *KalaClient) do(method, url string, expectedStatus int, payload, target
 	}
 	defer resp.Body.Close()
 	if status := resp.StatusCode; status != expectedStatus {
-		return status, ErrGenericError
+		// ErrGenericError stays comparable for existing callers; the server's
+		// explanation is carried separately so it cannot leak between requests.
+		return status, &unexpectedStatusError{status: status, message: errorMessageFrom(resp.Body)}
 	}
 	return resp.StatusCode, kc.decode(resp.Body, target)
+}
+
+// unexpectedStatusError is returned by do when the server answers with a status
+// other than the one expected. It compares equal to ErrGenericError so existing
+// callers keep working, and exposes the server's message.
+type unexpectedStatusError struct {
+	status  int
+	message string
+}
+
+func (e *unexpectedStatusError) Error() string {
+	if e.message != "" {
+		return fmt.Sprintf("%s (status %d): %s", ErrGenericError.Error(), e.status, e.message)
+	}
+	return fmt.Sprintf("%s (status %d)", ErrGenericError.Error(), e.status)
+}
+
+// Is lets errors.Is(err, ErrGenericError) keep returning true.
+func (e *unexpectedStatusError) Is(target error) bool { return target == ErrGenericError }
+
+// ServerMessage returns the explanation Kala included, if any.
+func (e *unexpectedStatusError) ServerMessage() string { return e.message }
+
+// StatusCode returns the HTTP status Kala answered with.
+func (e *unexpectedStatusError) StatusCode() int { return e.status }
+
+// errorMessageFrom extracts the "error" field of Kala's JSON error body, if
+// present. It never fails; an unreadable body yields "".
+func errorMessageFrom(body io.Reader) string {
+	var apiErr struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(body).Decode(&apiErr); err != nil {
+		return ""
+	}
+	return apiErr.Error
 }
 
 // CreateJob is used for creating a new job within Kala. Note that the
@@ -104,7 +142,7 @@ func (kc *KalaClient) CreateJob(body *job.Job) (string, error) {
 	id := &api.AddJobResponse{}
 	_, err := kc.do(methodPost, kc.url(jobPath), http.StatusCreated, body, id)
 	if err != nil {
-		if err == ErrGenericError {
+		if errors.Is(err, ErrGenericError) {
 			return "", ErrJobCreationError
 		}
 		return "", err
@@ -121,7 +159,7 @@ func (kc *KalaClient) GetJob(id string) (*job.Job, error) {
 	j := &api.JobResponse{}
 	_, err := kc.do(methodGet, kc.url(jobPath, id), http.StatusOK, nil, j)
 	if err != nil {
-		if err == ErrGenericError {
+		if errors.Is(err, ErrGenericError) {
 			return nil, ErrJobNotFound
 		}
 		return nil, err
@@ -141,6 +179,13 @@ func (kc *KalaClient) GetAllJobs() (map[string]*job.Job, error) {
 }
 
 // DeleteJob is used to delete a Job from Kala by its ID.
+//
+// A delete succeeds (true, nil) only when Kala confirmed both the removal and
+// its dependency repairs (HTTP 204). If the server refused or could not
+// complete the delete (HTTP 500, for example a storage failure or a backend
+// that cannot delete atomically), the returned error carries the server's
+// reason so the caller can distinguish it from an unreachable server. A repeat
+// delete of a job that is already gone also succeeds.
 // Example:
 // 		c := New("http://127.0.0.1:8000")
 //		id := "93b65499-b211-49ce-57e0-19e735cc5abd"
@@ -148,12 +193,31 @@ func (kc *KalaClient) GetAllJobs() (map[string]*job.Job, error) {
 func (kc *KalaClient) DeleteJob(id string) (bool, error) {
 	status, err := kc.do(methodDelete, kc.url(jobPath, id), http.StatusNoContent, nil, nil)
 	if err != nil {
-		if err == ErrGenericError {
-			return false, fmt.Errorf("Delete failed with a status code of %d", status)
+		if errors.Is(err, ErrGenericError) {
+			var statusErr *unexpectedStatusError
+			message := ""
+			if errors.As(err, &statusErr) {
+				message = statusErr.ServerMessage()
+			}
+			return false, &DeleteError{StatusCode: status, Message: message}
 		}
 		return false, err
 	}
 	return true, nil
+}
+
+// DeleteError reports a delete that Kala did not confirm. StatusCode is the
+// HTTP status Kala returned, and Message is its explanation when one was sent.
+type DeleteError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *DeleteError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("Delete failed with a status code of %d: %s", e.StatusCode, e.Message)
+	}
+	return fmt.Sprintf("Delete failed with a status code of %d", e.StatusCode)
 }
 
 // DeleteAllJobs is used to delete all jobs from Kala
@@ -183,7 +247,7 @@ func (kc *KalaClient) GetJobStats(id string) ([]*job.JobStat, error) {
 func (kc *KalaClient) StartJob(id string) (bool, error) {
 	_, err := kc.do(methodPost, kc.url(jobPath, "start", id), http.StatusNoContent, nil, nil)
 	if err != nil {
-		if err == ErrGenericError {
+		if errors.Is(err, ErrGenericError) {
 			return false, nil
 		}
 		return false, err
@@ -209,7 +273,7 @@ func (kc *KalaClient) GetKalaStats() (*job.KalaStats, error) {
 func (kc *KalaClient) DisableJob(id string) (bool, error) {
 	status, err := kc.do(methodPost, kc.url(jobPath, "disable", id), http.StatusNoContent, nil, nil)
 	if err != nil {
-		if err == ErrGenericError {
+		if errors.Is(err, ErrGenericError) {
 			return false, fmt.Errorf("Disable failed with a status code of %d", status)
 		}
 		return false, err
@@ -225,7 +289,7 @@ func (kc *KalaClient) DisableJob(id string) (bool, error) {
 func (kc *KalaClient) EnableJob(id string) (bool, error) {
 	status, err := kc.do(methodPost, kc.url(jobPath, "enable", id), http.StatusNoContent, nil, nil)
 	if err != nil {
-		if err == ErrGenericError {
+		if errors.Is(err, ErrGenericError) {
 			return false, fmt.Errorf("Enable failed with a status code of %d", status)
 		}
 		return false, err

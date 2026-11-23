@@ -168,6 +168,11 @@ func HandleJobRequest(cache job.JobCache) func(w http.ResponseWriter, r *http.Re
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := mux.Vars(r)["id"]
 
+		if r.Method == "DELETE" {
+			handleDeleteJob(cache, id, w)
+			return
+		}
+
 		j, err := cache.Get(id)
 		if err != nil {
 			log.Errorf("Error occurred when trying to get the job you requested.")
@@ -179,16 +184,24 @@ func HandleJobRequest(cache job.JobCache) func(w http.ResponseWriter, r *http.Re
 			return
 		}
 
-		if r.Method == "DELETE" {
-			err = j.Delete(cache)
-			if err != nil {
-				errorEncodeJSON(err, http.StatusInternalServerError, w)
-			} else {
-				w.WriteHeader(http.StatusNoContent)
-			}
-		} else if r.Method == "GET" {
-			handleGetJob(w, r, j)
-		}
+		handleGetJob(w, r, j)
+	}
+}
+
+// handleDeleteJob deletes one job. It returns 204 only when the delete and all
+// of its reference repairs are confirmed; storage, dependency-repair or
+// unsupported-backend failures return 500 with the reason, and an unknown id
+// returns 404. A repeat DELETE of an already-deleted job still returns 204 (the
+// delete is idempotent) and also completes a previously interrupted apply.
+func handleDeleteJob(cache job.JobCache, id string, w http.ResponseWriter) {
+	err := cache.Delete(id)
+	switch {
+	case err == nil:
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, job.ErrJobDoesntExist):
+		w.WriteHeader(http.StatusNotFound)
+	default:
+		errorEncodeJSON(err, http.StatusInternalServerError, w)
 	}
 }
 

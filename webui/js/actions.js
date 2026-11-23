@@ -60,6 +60,12 @@ var actions = (function() {
       ])
         .then(function() {
           store.do('deleteJob', id);
+        })
+        .catch(function(err) {
+          // The delete was not confirmed, so the job is still there. Refresh
+          // the list to show its real state rather than a stale removal.
+          console.error('deleting job failed: ', err);
+          actions.getJobs();
         });
     },
 

@@ -101,6 +101,78 @@ func (d DB) Save(j *job.Job) error {
 	return nil
 }
 
+// ApplyBatch runs the whole batch inside one MULTI/EXEC transaction, which
+// Redis executes atomically. A crash before EXEC leaves no partial writes.
+func (d DB) ApplyBatch(batch job.JobBatch) error {
+	updates, err := d.referenceUpdateValues(batch.Updates)
+	if err != nil {
+		return err
+	}
+
+	if err := d.conn.Send("MULTI"); err != nil {
+		return err
+	}
+	for _, j := range batch.Saves {
+		bytes, err := j.Bytes()
+		if err != nil {
+			d.abortTransaction()
+			return err
+		}
+		if err := d.conn.Send("HSET", HashKey, j.Id, bytes); err != nil {
+			d.abortTransaction()
+			return err
+		}
+	}
+	for _, upd := range updates {
+		if err := d.conn.Send("HSET", HashKey, upd.id, upd.bytes); err != nil {
+			d.abortTransaction()
+			return err
+		}
+	}
+	for _, id := range batch.Deletes {
+		if err := d.conn.Send("HDEL", HashKey, id); err != nil {
+			d.abortTransaction()
+			return err
+		}
+	}
+	_, err = d.conn.Do("EXEC")
+	return err
+}
+
+type referenceUpdateValue struct {
+	id    string
+	bytes []byte
+}
+
+// referenceUpdateValues loads each stored job named by an update and returns
+// the re-encoded record whose reference lists were replaced. Absent jobs are
+// skipped. Reads happen before MULTI so the transaction itself is write-only.
+func (d DB) referenceUpdateValues(updates []job.JobReferenceUpdate) ([]referenceUpdateValue, error) {
+	out := make([]referenceUpdateValue, 0, len(updates))
+	for _, upd := range updates {
+		stored, err := d.Get(upd.Id)
+		if err != nil {
+			// A job that is not stored (or was concurrently removed) is skipped,
+			// matching the batch contract.
+			continue
+		}
+		stored.ParentJobs = upd.ParentJobs
+		stored.DependentJobs = upd.DependentJobs
+		b, err := stored.Bytes()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, referenceUpdateValue{id: upd.Id, bytes: b})
+	}
+	return out, nil
+}
+
+// abortTransaction sends DISCARD so a partially queued MULTI does not linger
+// on the pooled connection.
+func (d DB) abortTransaction() {
+	_, _ = d.conn.Do("DISCARD")
+}
+
 // Close closes the connection to Redis.
 func (d DB) Close() error {
 	err := d.conn.Close()
@@ -109,3 +181,5 @@ func (d DB) Close() error {
 	}
 	return nil
 }
+
+var _ job.BatchJobDB = (*DB)(nil)

@@ -90,3 +90,16 @@ func (d DB) Close() error {
 	d.session.Close()
 	return nil
 }
+
+// mgo (the driver this backend uses) has no multi-document transaction, so a
+// delete and its reference repairs cannot be committed atomically: a crash
+// between Remove and Insert leaves a parent/child graph that names jobs that no
+// longer exist. The backend therefore refuses batch application; job deletes on
+// mongo fail with job.ErrAtomicBatchUnsupported instead of silently degrading to
+// a best-effort sequence.
+func (d DB) ApplyBatch(job.JobBatch) error {
+	return ErrTransactionsUnsupported
+}
+
+// ErrTransactionsUnsupported explains why mongo cannot serve job deletes.
+var ErrTransactionsUnsupported = job.ErrAtomicBatchUnsupported

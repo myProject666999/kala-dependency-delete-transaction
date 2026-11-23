@@ -98,3 +98,67 @@ func (db *ConsulJobDB) Save(j *job.Job) error {
 	_, err = db.conn.Put(pair, &api.WriteOptions{})
 	return err
 }
+
+// ApplyBatch commits the whole batch in one Consul transaction. Consul applies
+// a transaction all-or-nothing, so a crash leaves no half-updated reference
+// graph.
+func (db *ConsulJobDB) ApplyBatch(batch job.JobBatch) error {
+	var ops api.KVTxnOps
+
+	for _, j := range batch.Saves {
+		value, err := json.Marshal(j)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, &api.KVTxnOp{Verb: api.KVSet, Key: prefix + j.Id, Value: value})
+	}
+	for _, upd := range batch.Updates {
+		value, found, err := db.encodeReferenceUpdate(upd)
+		if err != nil {
+			return err
+		}
+		if found {
+			ops = append(ops, &api.KVTxnOp{Verb: api.KVSet, Key: prefix + upd.Id, Value: value})
+		}
+	}
+	for _, id := range batch.Deletes {
+		ops = append(ops, &api.KVTxnOp{Verb: api.KVDelete, Key: prefix + id})
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+
+	ok, resp, _, err := db.conn.Txn(ops, nil)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("consul rejected the job batch transaction: %v", resp.Errors)
+	}
+	return nil
+}
+
+// encodeReferenceUpdate returns the stored job re-encoded with only its
+// reference lists replaced, and reports false when the job is absent.
+func (db *ConsulJobDB) encodeReferenceUpdate(upd job.JobReferenceUpdate) ([]byte, bool, error) {
+	pair, _, err := db.conn.Get(prefix+upd.Id, &api.QueryOptions{RequireConsistent: true})
+	if err != nil {
+		return nil, false, err
+	}
+	if pair == nil {
+		return nil, false, nil
+	}
+	stored := new(job.Job)
+	if err := json.NewDecoder(bytes.NewBuffer(pair.Value)).Decode(stored); err != nil {
+		return nil, false, err
+	}
+	stored.ParentJobs = upd.ParentJobs
+	stored.DependentJobs = upd.DependentJobs
+	value, err := json.Marshal(stored)
+	if err != nil {
+		return nil, false, err
+	}
+	return value, true, nil
+}
+
+var _ job.BatchJobDB = (*ConsulJobDB)(nil)

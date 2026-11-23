@@ -142,6 +142,15 @@ var serveCmd = &cobra.Command{
 		log.Infof("Preparing cache")
 		cache := job.NewLockFreeJobCache(db)
 
+		// A delete persists the removal and its dependency repairs as one atomic
+		// batch. Warn up front if the chosen backend cannot do that, because
+		// DELETE requests will then be refused rather than silently performed
+		// best-effort.
+		if _, ok := db.(job.BatchJobDB); !ok {
+			log.Warnf("Storage backend %q cannot delete a job and repair its references atomically; "+
+				"DELETE requests will be refused (HTTP 500)", viper.GetString("jobdb"))
+		}
+
 		// Persistence mode
 		persistEvery := viper.GetInt("persist-every")
 		if viper.GetBool("no-tx-persist") {

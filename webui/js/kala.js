@@ -59,9 +59,19 @@
       return fetch(ApiJobEndpoint + id + '/', {
         method: 'delete'
       })
-        .catch(function(ex) {
-          console.error('deleting job failed: ', ex)
-        })
+        .then(function(response) {
+          // 204 means Kala confirmed the delete and its dependency repairs.
+          // 404 means it was already gone, which is fine. Anything else means
+          // it did not happen; surface the reason instead of pretending.
+          if (response.status === 204 || response.status === 404) {
+            return { ok: true };
+          }
+          return response.json()
+            .catch(function() { return {}; })
+            .then(function(json) {
+              throw new Error(json.error || ('Delete failed with status ' + response.status));
+            });
+        });
     },
     createJob: function(job) {
       return fetch(ApiJobEndpoint, {

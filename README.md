@@ -319,6 +319,14 @@ $ curl http://127.0.0.1:8000/api/v1/job/93b65499-b211-49ce-57e0-19e735cc5abd/ -X
 $ curl http://127.0.0.1:8000/api/v1/job/93b65499-b211-49ce-57e0-19e735cc5abd/
 ```
 
+The DELETE is synchronous and returns `204 No Content` only once the job and
+all of its dependency-reference repairs are committed. `404` means the id is
+unknown. `500` means the delete did not complete; the body carries the reason
+(for example a storage failure, or a backend that cannot delete atomically).
+Deleting an already-deleted job is idempotent and returns `204`.
+
+See [Deleting a job and its references](#deleting-a-job-and-its-references).
+
 ## /job/stats/{id}
 
 Example:
@@ -381,6 +389,40 @@ Check out this [example for how to add dependent jobs](https://github.com/ajvb/k
 * If a child job is disabled, it's parent job will still run, but it will not.
 * If a child job is deleted, it's parent job will continue to stay around.
 * If a parent job is deleted, unless its child jobs have another parent, they will be deleted as well.
+
+### Deleting a job and its references
+
+A delete is one synchronous, recoverable operation. Kala computes a plan (the
+job, any cascaded children, and the surviving jobs whose reference lists
+change), commits the whole plan to storage in a single atomic batch, and only
+then updates the in-memory cache. Success is reported only after the backend
+confirms the batch.
+
+* **Cascade boundary.** A job is deleted only when its sole parent is the job
+  being deleted. A child with several parents loses the deleted parent edge and
+  survives. A child that does not name the deleted job as a parent (an
+  asymmetric or dangling reference) is never cascaded; the stale edge is simply
+  dropped. Duplicate edges are collapsed. A shared descendant is visited once.
+* **Backends.** Atomic batches are implemented for boltdb (one Bolt
+  transaction), Redis (`MULTI`/`EXEC`), MySQL and Postgres (one SQL
+  transaction) and Consul (one Consul transaction). mongo has no
+  multi-document transaction in the driver it uses, so deletes against mongo
+  are refused with `ErrAtomicBatchUnsupported` rather than performed
+  best-effort.
+* **Lock order.** The cache's graph mutex is always taken before any job lock,
+  for both creation and deletion, which is what prevents opposite-direction
+  deletes from deadlocking. Every failure path releases the locks.
+* **Failure states.** If the batch does not commit, the cache is untouched and
+  the caller gets a `*DeleteError` with phase `persist` and `Committed=false`;
+  a retry re-attempts the batch. If the batch commits but the in-memory apply
+  panics, the caller gets phase `apply` with `Committed=true`; storage is
+  already final, and either retrying the same DELETE (which resumes the
+  retained plan without re-committing) or rebuilding the cache from storage
+  recovers the committed state.
+* **No resurrection.** A deleted id is tombstoned, so a run that finishes after
+  its job was deleted cannot write the job back into the cache or storage.
+* **Repeat calls.** Repeating a DELETE of an already-deleted id is idempotent
+  and does not replay cascade side effects.
 
 # Original Contributors and Contact
 

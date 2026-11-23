@@ -1,10 +1,14 @@
 package job
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+var errApplyInjected = errors.New("injected batch commit failure")
 
 // This file contains tests that can be run against all types of JobCaches.
 
@@ -45,22 +49,22 @@ func testCache(t *testing.T, cache JobCache) {
 
 func TestCachePersistence(t *testing.T) {
 
-	mdb1a := NewMemoryDB()
+	mdb1a := &FailingBatchDB{JobDB: NewMemoryDB()}
 	cache1a := NewMemoryJobCache(mdb1a)
 
-	mdb1b := NewMemoryDB()
+	mdb1b := &FailingBatchDB{JobDB: NewMemoryDB()}
 	cache1b := NewMemoryJobCache(mdb1b)
 	cache1b.PersistOnWrite = true
 
-	mdb2a := NewMemoryDB()
+	mdb2a := &FailingBatchDB{JobDB: NewMemoryDB()}
 	cache2a := NewLockFreeJobCache(mdb2a)
 
-	mdb2b := NewMemoryDB()
+	mdb2b := &FailingBatchDB{JobDB: NewMemoryDB()}
 	cache2b := NewLockFreeJobCache(mdb2b)
 	cache2b.PersistOnWrite = true
 
 	tt := []struct {
-		db            JobDB
+		db            *FailingBatchDB
 		c             JobCache
 		shouldPersist bool
 	}{
@@ -98,7 +102,7 @@ func TestCachePersistence(t *testing.T) {
 // We verify that it's either persisting to the JobDB upon each creation/update/delete, or not, as appropriate.
 // Note that deletes always propagate to the db, and return an error if that fails,
 // but if transactional persistence is turned off the cache will still delete from itself.
-func testCachePersistence(t *testing.T, cache JobCache, db JobDB, shouldPersist bool) {
+func testCachePersistence(t *testing.T, cache JobCache, db *FailingBatchDB, shouldPersist bool) {
 
 	t.Run("testCachePersistence", func(t *testing.T) {
 
@@ -159,18 +163,27 @@ func testCachePersistence(t *testing.T, cache JobCache, db JobDB, shouldPersist 
 				if !shouldPersist {
 					assert.NoError(t, cache.Persist())
 				}
-				assert.NoError(t, db.Delete(j.Id))
 
-				assert.Error(t, cache.Delete(j.Id))
-				ret, err := cache.Get(j.Id)
-				if shouldPersist {
-					assert.NoError(t, err)
-					assert.Equal(t, j.Id, ret.Id)
-				} else {
-					assert.Error(t, err)
-					assert.Equal(t, (*Job)(nil), ret)
-				}
+				// A delete that cannot be committed must fail, must leave the
+				// job in the cache, and must be retryable once the backend
+				// recovers.
+				db.setApplyErr(errApplyInjected)
 
+				err := cache.Delete(j.Id)
+				require.Error(t, err)
+				assert.ErrorIs(t, err, errApplyInjected)
+				phase, isDeleteErr := deleteErrorPhase(err)
+				require.True(t, isDeleteErr)
+				assert.Equal(t, DeletePhasePersist, phase)
+
+				ret, getErr := cache.Get(j.Id)
+				assert.NoError(t, getErr, "an uncommitted delete must not remove the job")
+				assert.Equal(t, j.Id, ret.Id)
+
+				db.setApplyErr(nil)
+				assert.NoError(t, cache.Delete(j.Id), "a retry after the backend recovers must succeed")
+				_, getErr = cache.Get(j.Id)
+				assert.Equal(t, ErrJobDoesntExist, getErr)
 			})
 
 		})

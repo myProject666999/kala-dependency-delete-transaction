@@ -1,6 +1,7 @@
 package job
 
 import (
+	"errors"
 	"fmt"
 
 	log "github.com/sirupsen/logrus"
@@ -13,6 +14,14 @@ func (id ErrJobNotFound) Error() string {
 	return fmt.Sprintf("Job with id of %s not found.", string(id))
 }
 
+// ErrAtomicBatchUnsupported is returned when a backend cannot apply a job
+// delete together with its dependency repairs as one all-or-nothing unit.
+// Such a delete is refused rather than degraded to best-effort: a half-updated
+// reference graph is exactly what the synchronous delete exists to prevent.
+var ErrAtomicBatchUnsupported = errors.New(
+	"job storage backend cannot apply a delete and its dependency repairs atomically",
+)
+
 type JobDB interface {
 	GetAll() ([]*Job, error)
 	Get(id string) (*Job, error)
@@ -22,13 +31,11 @@ type JobDB interface {
 }
 
 func (j *Job) Delete(cache JobCache) error {
-	var err error
-	errOne := cache.Delete(j.Id)
-	if errOne != nil {
-		log.Errorf("Error occurred while trying to delete job from cache: %s", errOne)
-		err = errOne
+	if err := cache.Delete(j.Id); err != nil {
+		log.Errorf("Error occurred while trying to delete job from cache: %s", err)
+		return err
 	}
-	return err
+	return nil
 }
 
 func DeleteAll(cache JobCache) error {

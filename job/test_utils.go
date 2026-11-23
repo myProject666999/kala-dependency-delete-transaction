@@ -19,23 +19,75 @@ func (d *MockDBGetAll) GetAll() ([]*Job, error) {
 	return d.response, nil
 }
 
-type MockDB struct{}
+// MockDB is an in-memory, always-succeeding JobDB used by the API tests and by
+// --no-persist mode. It implements the atomic batch contract.
+type MockDB struct {
+	lock   sync.Mutex
+	stored map[string]*Job
+}
 
 func (m *MockDB) GetAll() ([]*Job, error) {
-	return nil, nil
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	out := make([]*Job, 0, len(m.stored))
+	for _, j := range m.stored {
+		out = append(out, j)
+	}
+	return out, nil
 }
 func (m *MockDB) Get(id string) (*Job, error) {
-	return nil, nil
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	j, ok := m.stored[id]
+	if !ok {
+		return nil, ErrJobNotFound(id)
+	}
+	return j, nil
 }
 func (m *MockDB) Delete(id string) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	delete(m.stored, id)
 	return nil
 }
 func (m *MockDB) Save(job *Job) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	if m.stored == nil {
+		m.stored = map[string]*Job{}
+	}
+	m.stored[job.Id] = job
 	return nil
 }
 func (m *MockDB) Close() error {
 	return nil
 }
+
+// ApplyBatch applies the whole batch under one lock. Nothing is written if the
+// batch cannot be applied (this implementation never fails mid-batch), so the
+// all-or-nothing contract holds.
+func (m *MockDB) ApplyBatch(batch JobBatch) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	if m.stored == nil {
+		m.stored = map[string]*Job{}
+	}
+	for _, j := range batch.Saves {
+		m.stored[j.Id] = j
+	}
+	for _, id := range batch.Deletes {
+		delete(m.stored, id)
+	}
+	for _, u := range batch.Updates {
+		if j, ok := m.stored[u.Id]; ok {
+			j.ParentJobs = u.ParentJobs
+			j.DependentJobs = u.DependentJobs
+		}
+	}
+	return nil
+}
+
+var _ BatchJobDB = (*MockDB)(nil)
 
 func NewMockCache() *LockFreeJobCache {
 	return NewLockFreeJobCache(&MockDB{})
@@ -196,6 +248,74 @@ func (m *MemoryDB) Save(j *Job) error {
 	m.m[j.Id] = j
 	return nil
 }
+
+// ApplyBatch applies the whole batch under one lock; the in-memory map cannot
+// fail part-way, so the all-or-nothing contract holds.
+func (m *MemoryDB) ApplyBatch(batch JobBatch) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	for _, j := range batch.Saves {
+		m.m[j.Id] = j
+	}
+	for _, id := range batch.Deletes {
+		delete(m.m, id)
+	}
+	for _, u := range batch.Updates {
+		if j, ok := m.m[u.Id]; ok {
+			j.ParentJobs = u.ParentJobs
+			j.DependentJobs = u.DependentJobs
+		}
+	}
+	return nil
+}
+
+var _ BatchJobDB = (*MemoryDB)(nil)
+
+// FailingBatchDB wraps a JobDB whose batch commits can be made to fail. It is
+// used to prove that a delete which cannot be committed leaves the cache
+// untouched, and that a repeat delete can succeed afterwards.
+type FailingBatchDB struct {
+	JobDB
+	// ApplyErr, when non-nil, is returned by ApplyBatch and no write happens.
+	ApplyErr error
+	// Calls counts ApplyBatch invocations.
+	Calls int
+	// Applied records the batches that were committed.
+	Applied []JobBatch
+	lock    sync.Mutex
+}
+
+func (f *FailingBatchDB) ApplyBatch(batch JobBatch) error {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	f.Calls++
+	if f.ApplyErr != nil {
+		return f.ApplyErr
+	}
+	batcher, ok := f.JobDB.(BatchJobDB)
+	if !ok {
+		return ErrAtomicBatchUnsupported
+	}
+	if err := batcher.ApplyBatch(batch); err != nil {
+		return err
+	}
+	f.Applied = append(f.Applied, batch)
+	return nil
+}
+
+func (f *FailingBatchDB) setApplyErr(err error) {
+	f.lock.Lock()
+	f.ApplyErr = err
+	f.lock.Unlock()
+}
+
+func (f *FailingBatchDB) calls() int {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	return f.Calls
+}
+
+var _ BatchJobDB = (*FailingBatchDB)(nil)
 
 func (m *MemoryDB) Close() error {
 	return nil

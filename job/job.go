@@ -183,10 +183,18 @@ func NewFromBytes(b []byte) (*Job, error) {
 }
 
 // Init fills in the protected fields and parses the iso8601 notation.
-// It also adds the job to the Cache
+// It also adds the job to the Cache.
+//
+// Parent lookup and creation happen under the cache's graph mutex (for
+// *LockFreeJobCache / *MemoryJobCache) so a concurrent delete of a parent
+// cannot plan against a half-registered child, and so the parent cannot vanish
+// between lookup and registration. The graph mutex is always taken before any
+// job lock, the same order cache.Delete uses, which keeps the two from
+// deadlocking.
 func (j *Job) Init(cache JobCache) error {
+	unlockGraph := lockCacheGraph(cache)
+
 	j.lock.Lock()
-	defer j.lock.Unlock()
 
 	// use the cache's clock if available (useful for tests)
 	if clker, ok := cache.(Clocker); ok {
@@ -196,13 +204,16 @@ func (j *Job) Init(cache JobCache) error {
 	}
 
 	// validate job type and params
-	err := j.validation()
-	if err != nil {
+	if err := j.validation(); err != nil {
+		j.lock.Unlock()
+		unlockGraph()
 		return err
 	}
 
 	u4, err := uuid.NewV4()
 	if err != nil {
+		j.lock.Unlock()
+		unlockGraph()
 		log.Errorf("Error occurred when generating uuid: %s", err)
 		return err
 	}
@@ -214,25 +225,27 @@ func (j *Job) Init(cache JobCache) error {
 	for _, p := range j.ParentJobs {
 		parentJob, err := cache.Get(p)
 		if err != nil {
+			j.lock.Unlock()
+			unlockGraph()
 			return err
 		}
 		parentJobs = append(parentJobs, parentJob)
 	}
-
-	// Add Job to the cache.
 	j.lock.Unlock()
-	err = cache.Set(j)
-	j.lock.Lock()
+
+	// Add the job, and register it with its parents, as a single write.
+	// Otherwise a failure between the two steps would leave a child that the
+	// API reported as rejected, or a parent whose dependent list names a job
+	// that was never created.
+	err = registerCreatedJob(cache, j, parentJobs)
+	unlockGraph()
 	if err != nil {
 		return err
 	}
+	j.lock.Lock()
+	defer j.lock.Unlock()
 
 	if len(parentJobs) != 0 {
-		// Add new job to parent jobs
-		for _, parentJob := range parentJobs {
-			parentJob.DependentJobs = append(parentJob.DependentJobs, j.Id)
-		}
-
 		return nil
 	}
 
@@ -259,6 +272,40 @@ func (j *Job) Init(cache JobCache) error {
 	j.lock.Lock()
 
 	return nil
+}
+
+// registerCreatedJob writes a newly created job and, when it has parents, the
+// parent reference updates, through the backend's atomic batch when the cache
+// exposes one. It refuses rather than writing the two halves separately.
+//
+// It is only called for caches that expose registerJobBatch; a foreign JobCache
+// without one is handled by Init directly, because that path calls cache.Set,
+// which itself takes the cache's graph mutex.
+func registerCreatedJob(cache JobCache, j *Job, parents []*Job) error {
+	type batchCreator interface {
+		registerJobBatch(j *Job, parents []*Job) error
+	}
+	bc, ok := cache.(batchCreator)
+	if !ok {
+		return ErrAtomicBatchUnsupported
+	}
+	return bc.registerJobBatch(j, parents)
+}
+
+// lockCacheGraph takes the cache's graph mutex, if the cache has one, and
+// returns the matching unlock function. Caches without a graph mutex (only
+// foreign JobCache implementations) yield a no-op unlock.
+func lockCacheGraph(cache JobCache) func() {
+	switch c := cache.(type) {
+	case *LockFreeJobCache:
+		c.graph.Lock()
+		return c.graph.Unlock
+	case *MemoryJobCache:
+		c.graph.Lock()
+		return c.graph.Unlock
+	default:
+		return func() {}
+	}
 }
 
 // InitDelayDuration is used to parsed the iso8601 Schedule notation into its relevant fields in the Job struct.
@@ -411,77 +458,14 @@ func (j *Job) Enable(cache JobCache) error {
 	return cache.Enable(j)
 }
 
-// DeleteFromParentJobs goes through and deletes the current job from any parent jobs.
-func (j *Job) DeleteFromParentJobs(cache JobCache) error {
-	j.lock.Lock()
-	defer j.lock.Unlock()
-
-	for _, p := range j.ParentJobs {
-		parentJob, err := cache.Get(p)
-
-		if err != nil {
-			return err
-		}
-
-		parentJob.lock.Lock()
-
-		ndx := 0
-		for i, id := range parentJob.DependentJobs {
-			if id == j.Id {
-				ndx = i
-				break
-			}
-		}
-		parentJob.DependentJobs = append(
-			parentJob.DependentJobs[:ndx], parentJob.DependentJobs[ndx+1:]...,
-		)
-		err = cache.Set(parentJob)
-		if err != nil {
-			return err
-		}
-		parentJob.lock.Unlock()
-	}
-
-	return nil
-}
-
-// DeleteFromDependentJobs
-func (j *Job) DeleteFromDependentJobs(cache JobCache) error {
-	j.lock.RLock()
-	defer j.lock.RUnlock()
-
-	for _, id := range j.DependentJobs {
-		childJob, err := cache.Get(id)
-		if err != nil {
-			return err
-		}
-
-		// If there are no other parent jobs, delete this job.
-		if len(childJob.ParentJobs) == 1 {
-			log.Infof("Deleting child %s", id)
-			_ = cache.Delete(childJob.Id)
-			continue
-		}
-
-		childJob.lock.Lock()
-
-		ndx := 0
-		for i, id := range childJob.ParentJobs {
-			if id == j.Id {
-				ndx = i
-				break
-			}
-		}
-		childJob.ParentJobs = append(
-			childJob.ParentJobs[:ndx], childJob.ParentJobs[ndx+1:]...,
-		)
-
-		childJob.lock.Unlock()
-
-	}
-
-	return nil
-}
+// The v1 reference-repair helpers DeleteFromParentJobs and
+// DeleteFromDependentJobs were removed. They mutated the graph in place, used
+// a zero index when the id they meant to remove was absent (deleting an
+// unrelated first element), could return with a parent's lock still held, and
+// never persisted the child they rewrote. They ran in background goroutines
+// whose errors were only logged, so a caller could not tell whether the
+// references had been repaired. cache.Delete now plans and applies the same
+// repair synchronously as one atomic, recoverable operation (see delete.go).
 
 // Runs the on failure job, if it exists. Does not lock the parent job - it is up to you to do this
 // however you want
@@ -525,11 +509,13 @@ func (j *Job) Run(cache JobCache) {
 	// Some refactoring is probably in order.
 
 	j.lock.Unlock()
-	j.lock.RLock()
+	// Set takes the cache's graph mutex, which delete also takes before a job
+	// lock, so this must be called without the job lock held.
+	// A run that started before its job was deleted must not write the job
+	// back. Set ignores tombstoned ids, so this is a log-only signal.
 	if err := cache.Set(j); err != nil {
 		log.Errorf("Job %s with id %s ran, but the results couldn't be persisted: %v", j.Name, j.Id, err)
 	}
-	j.lock.RUnlock()
 	j.lock.Lock()
 
 	if j.ShouldStartWaiting() {

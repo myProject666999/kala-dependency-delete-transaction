@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/go-sql-driver/mysql"
@@ -122,3 +123,77 @@ func (d DB) Save(j *job.Job) error {
 func (d DB) Close() error {
 	return d.conn.Close()
 }
+
+// ApplyBatch writes the whole batch in one SQL transaction. InnoDB commits the
+// transaction entirely or not at all, so a crash leaves no half-updated
+// reference graph.
+func (d DB) ApplyBatch(batch job.JobBatch) error {
+	transaction, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	rollback := func(err error) error {
+		transaction.Rollback() //nolint:errcheck // adding insult to injury
+		return err
+	}
+
+	saveQuery := fmt.Sprintf(`replace into %[1]s (id, job) values(?, ?);`, TableName)
+	updateQuery := fmt.Sprintf(`update %[1]s set job = ? where id = ?;`, TableName)
+	deleteQuery := fmt.Sprintf(`delete from %[1]s where id = ?;`, TableName)
+
+	for _, j := range batch.Saves {
+		encoded, err := json.Marshal(j)
+		if err != nil {
+			return rollback(err)
+		}
+		if _, err := transaction.Exec(saveQuery, j.Id, string(encoded)); err != nil {
+			return rollback(err)
+		}
+	}
+	for _, upd := range batch.Updates {
+		encoded, found, err := encodeReferenceUpdate(transaction, upd)
+		if err != nil {
+			return rollback(err)
+		}
+		if found {
+			if _, err := transaction.Exec(updateQuery, encoded, upd.Id); err != nil {
+				return rollback(err)
+			}
+		}
+	}
+	for _, id := range batch.Deletes {
+		if _, err := transaction.Exec(deleteQuery, id); err != nil {
+			return rollback(err)
+		}
+	}
+	return transaction.Commit()
+}
+
+// encodeReferenceUpdate reads the stored job and returns its record with only
+// the reference lists replaced. It reports false when the job is absent.
+func encodeReferenceUpdate(tx *sql.Tx, upd job.JobReferenceUpdate) (string, bool, error) {
+	selectQuery := fmt.Sprintf(`select job from %[1]s where id = ?;`, TableName)
+	var raw sql.NullString
+	if err := tx.QueryRow(selectQuery, upd.Id).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	if !raw.Valid {
+		return "", false, nil
+	}
+	stored := &job.Job{}
+	if err := json.Unmarshal([]byte(raw.String), stored); err != nil {
+		return "", false, err
+	}
+	stored.ParentJobs = upd.ParentJobs
+	stored.DependentJobs = upd.DependentJobs
+	encoded, err := json.Marshal(stored)
+	if err != nil {
+		return "", false, err
+	}
+	return string(encoded), true, nil
+}
+
+var _ job.BatchJobDB = (*DB)(nil)
